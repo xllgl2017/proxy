@@ -7,7 +7,7 @@ edition = "2024"
 regex = "1.11.1"
 rcgen = { version = "0.13.2", features = ["crypto", "x509-parser", "aws_lc_rs"] }
 time = { version = "0.3.41", features = ["macros", "local-offset"] }
-tokio-rustls = "0.26.2"
+tokio-rustls = "0.26.4"
 rustls = "0.23.27"
 rustls-pki-types = "1.12.0"
 rustls-pemfile = "2.2.0"
@@ -18,9 +18,10 @@ uuid = { version = "1.17.0", features = ["v4"] }
 eframe = "0.31.1"
 egui = "0.31.1"
 egui_extras = { version = "0.31.1", features = ["image", "file"] }
+reqrio = { path = "../reqrio/reqrio", features = ["tokio"] }
 
 [dependencies.tokio]
-version = "1.45.1"
+version = "1.48.0"
 features = [
     "rt",
     "rt-multi-thread",

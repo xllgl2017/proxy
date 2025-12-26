@@ -1,60 +1,117 @@
+use std::fmt::Display;
+use std::mem;
 use std::sync::Arc;
 use log::{error, trace};
+use reqrio::{tokio, Buffer, Method, Response};
+use reqrio::tokio::io::AsyncWriteExt;
+use reqrio::tokio::net::TcpStream;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::{DnsName, ServerName};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::TcpStream;
-use tokio::sync;
+use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
+use tokio::sync::mpsc::Sender;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 use crate::error::{ProxyError, ProxyResult};
 use crate::{gen_acceptor_for_sni, regex_find};
-use crate::data::{ProxyData, StreamDirection};
+use crate::data::http::Request;
+
+#[derive(Clone)]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+impl Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Direction::ClientToServer => f.write_str("ClientToServer"),
+            Direction::ServerToClient => f.write_str("ServerToClient"),
+        }
+    }
+}
+
+pub struct ProxyParam {
+    sid: String,
+    sender: Sender<(Direction, Response)>,
+    buffer: Buffer,
+    data: Request,
+    direction: Direction,
+}
+
+impl Clone for ProxyParam {
+    fn clone(&self) -> Self {
+        ProxyParam {
+            sid: self.sid.clone(),
+            sender: self.sender.clone(),
+            buffer: Buffer::new(),
+            data: Request::new(),
+            direction: self.direction.clone(),
+        }
+    }
+}
 
 //
 pub struct ProxyStream {
     //生成一个id以便区分流
-    stream_id: String,
     inbound: TcpStream,
-    sender: sync::mpsc::Sender<ProxyData>,
+    param: ProxyParam,
 }
 
 impl ProxyStream {
-    pub fn new(inbound: TcpStream, sender: sync::mpsc::Sender<ProxyData>) -> ProxyStream {
+    pub fn new(inbound: TcpStream, sender: Sender<(Direction, Response)>) -> ProxyStream {
         ProxyStream {
             inbound,
-            sender,
-            stream_id: Uuid::new_v4().to_string(),
+            param: ProxyParam {
+                sid: Uuid::new_v4().to_string(),
+                sender,
+                //初始化一个缓冲区
+                buffer: Buffer::new(),
+                data: Request::new(),
+                direction: Direction::ClientToServer,
+            },
         }
     }
 
-    async fn copy<'a, I, O>(mut reader: ReadHalf<I>, mut writer: WriteHalf<O>, direction: StreamDirection,
-                            sender: sync::mpsc::Sender<ProxyData>, stream_id: String) -> JoinHandle<ProxyResult<()>>
+    async fn copy<'a, I, O>(mut reader: ReadHalf<I>, mut writer: WriteHalf<O>, mut param: ProxyParam) -> JoinHandle<ProxyResult<()>>
     where
         I: AsyncReadExt + Send + Unpin + 'static,
         O: AsyncWriteExt + Send + Unpin + 'static,
     {
         tokio::spawn(async move {
             loop {
-                let mut buffer = [0; 4096];
-                let len = reader.read(&mut buffer).await?;
+                param.buffer.read(&mut reader).await?;
                 //及时把数据发送出去，减少延时
-                writer.write(&buffer[..len]).await?;
-                if len == 0 { break; } //读取长度为0时，此tcp连接已断开
-                let data = ProxyData::new(direction.clone(), buffer, len, stream_id.clone());
-                sender.send(data).await?;
+                writer.write_all(param.buffer.as_ref()).await?;
+                if param.buffer.len() == 0 { break; } //读取长度为0时，此tcp连接已断开
+                match param.direction {
+                    Direction::ClientToServer => {
+                        let method = param.buffer.as_ref().split(|&c| c == b' ' as u8).next();
+                        if let Some(method) = method && Method::try_from(method).is_ok() {
+                            //新的请求，把旧的的请求发到ui
+                            let request = mem::replace(&mut param.data, Request::new());
+                            param.sender.send((param.direction.clone(), request)).await?;
+                        }
+                        param.data.extend(&param.buffer)?;
+                    }
+                    Direction::ServerToClient => {
+                        if param.data.extend(&param.buffer)? {
+                            let response = mem::replace(&mut param.data, Response::new());
+                            param.sender.send((param.direction.clone(), response)).await?;
+                        }
+                    }
+                }
             }
             Ok::<(), ProxyError>(())
         })
     }
 
-    async fn copy_io<I, O>(inbound: I, outbound: O, sender: sync::mpsc::Sender<ProxyData>, stream_id: String) -> ProxyResult<()>
+    async fn copy_io<I, O>(inbound: I, outbound: O, mut param: ProxyParam) -> ProxyResult<()>
     where
         I: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
         O: AsyncReadExt + AsyncWriteExt + Send + Unpin + 'static,
     {
-        let res_func = |res: Result<ProxyResult<()>, JoinError>, direction: StreamDirection| {
+        let res_func = |res: Result<ProxyResult<()>, JoinError>, direction: Direction| {
             match res {
                 Ok(r) => match r {
                     Ok(()) => {}
@@ -65,21 +122,22 @@ impl ProxyStream {
         };
         let (inbound_reader, inbound_writer) = tokio::io::split(inbound);
         let (outbound_reader, outbound_writer) = tokio::io::split(outbound);
-        let rt1 = ProxyStream::copy(inbound_reader, outbound_writer, StreamDirection::ClientToServer, sender.clone(), stream_id.clone()).await;
-        let rt2 = ProxyStream::copy(outbound_reader, inbound_writer, StreamDirection::ServerToClient, sender, stream_id).await;
+        let rt1 = ProxyStream::copy(inbound_reader, outbound_writer, param.clone()).await;
+        param.direction = Direction::ServerToClient;
+        let rt2 = ProxyStream::copy(outbound_reader, inbound_writer, param).await;
         let (r1, r2) = tokio::join!(rt1,rt2);
-        res_func(r1, StreamDirection::ClientToServer);
-        res_func(r2, StreamDirection::ServerToClient);
+        res_func(r1, Direction::ClientToServer);
+        res_func(r2, Direction::ServerToClient);
         Ok(())
     }
 
-    async fn handle_http(self, buffer: [u8; 4096], len: usize) -> ProxyResult<()> {
+    async fn handle_http(self) -> ProxyResult<()> {
         let http_prefix = b"http://";
-        let start_pos = buffer.windows(http_prefix.len()).position(|b| b == http_prefix).ok_or("获取HTTP地址失败")?;
-        let end_pos = buffer[start_pos + http_prefix.len()..len].iter().position(|b| *b == b'/').ok_or("获取HTTP地址失败")? + start_pos + http_prefix.len();
+        let start_pos = self.param.buffer.as_ref().windows(http_prefix.len()).position(|b| b == http_prefix).ok_or("获取HTTP地址失败")?;
+        let end_pos = self.param.buffer.as_ref()[start_pos + http_prefix.len()..].iter().position(|b| *b == b'/').ok_or("获取HTTP地址失败")? + start_pos + http_prefix.len();
         println!("{} {}", start_pos, end_pos);
         //获取真实服务器地址，端口为80的会自动省略
-        let addr = String::from_utf8(buffer[start_pos + http_prefix.len()..end_pos].to_vec())?;
+        let addr = String::from_utf8(self.param.buffer.as_ref()[start_pos + http_prefix.len()..end_pos].to_vec())?;
         println!("{}", addr);
         let host = addr.split(":").next().unwrap();
         let port = match addr.contains(":") {
@@ -91,13 +149,15 @@ impl ProxyStream {
         //与真实服务器建立连接，并把两个stream相互复制
         let mut outbound = TcpStream::connect(format!("{}:{}", host, port)).await?;
         // outbound.write(&buffer[..len]).await?;
-        outbound.write(&buffer[..start_pos]).await?;
-        outbound.write(&buffer[end_pos..len]).await?;
-        ProxyStream::copy_io(self.inbound, outbound, self.sender, self.stream_id).await
+        if start_pos > 0 {
+            outbound.write_all(&self.param.buffer[..start_pos]).await?;
+        }
+        outbound.write(&self.param.buffer.as_ref()[end_pos..]).await?;
+        ProxyStream::copy_io(self.inbound, outbound, self.param).await
     }
 
-    async fn handle_https(mut self, buffer: [u8; 4096], len: usize) -> ProxyResult<()> {
-        let info = String::from_utf8(buffer[..len].to_vec())?;
+    async fn handle_https(mut self) -> ProxyResult<()> {
+        let info = String::from_utf8_lossy(self.param.buffer.as_ref()).to_string();
         let addr = regex_find("CONNECT (.*?) ", info.as_str())?;
         if addr.len() == 0 { return Err("获取HTTPS真实地址失败".into()); }
         self.inbound.write(b"HTTP/1.1 200 OK\r\n\r\n").await?;
@@ -117,17 +177,16 @@ impl ProxyStream {
         // //这里我们就实现了HTTPS解密，但是我们的根证书还没安装
         // //sudo cp sca.pem /etc/pki/ca-trust/source/anchors/
         // //sudo update-ca-trust
-        ProxyStream::copy_io(inbound, outbound, self.sender, self.stream_id).await
+        ProxyStream::copy_io(inbound, outbound, self.param).await
     }
 
     pub async fn start(mut self) -> ProxyResult<()> {
-        let mut buffer = [0; 4096];
-        let len = self.inbound.read(&mut buffer).await?;
+        self.param.buffer.read(&mut self.inbound).await?;
 
-        if buffer.starts_with(b"CONNECT") {
-            self.handle_https(buffer, len).await?;
+        if self.param.buffer.as_ref().starts_with(b"CONNECT") {
+            self.handle_https().await?;
         } else {
-            self.handle_http(buffer, len).await?;
+            self.handle_http().await?;
         }
         Ok(())
     }

@@ -16,34 +16,35 @@ use log4rs::Config;
 use log4rs::config::{Appender, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use log::{debug, error, info, trace, LevelFilter};
+use reqrio::Response;
 use rustls::ServerConfig;
 use rustls_pemfile::Item;
 use rustls_pki_types::PrivateKeyDer;
 use tokio::net::TcpListener;
 use tokio::sync;
+use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
 use tokio_rustls::TlsAcceptor;
-use crate::data::{HttpTcpData, ProxyData, StreamDirection};
 use crate::error::ProxyResult;
 use crate::gui::ProxyView;
-use crate::proxy::ProxyStream;
-fn main() {
-    let viewport = ViewportBuilder::default()
-        .with_title("Proxy").with_inner_size((1200.0, 6000.0));
-    let mut native_options = eframe::NativeOptions::default();
-    native_options.viewport=viewport;
-    eframe::run_native("Proxy", native_options, Box::new(|cc| ProxyView::new(cc))).unwrap();
-}
-
-// #[tokio::main]
-// async fn main() {
-//     tokio::spawn(async {
-//         init_log4rs().unwrap();
-//         start_server().await.unwrap();
-//     });
-//     sleep(Duration::from_secs(100000)).await;
-//     // start_socks5_server().await.unwrap()
+use crate::proxy::{Direction, ProxyStream};
+// fn main() {
+//     let viewport = ViewportBuilder::default()
+//         .with_title("Proxy").with_inner_size((1200.0, 6000.0));
+//     let mut native_options = eframe::NativeOptions::default();
+//     native_options.viewport=viewport;
+//     eframe::run_native("Proxy", native_options, Box::new(|cc| ProxyView::new(cc))).unwrap();
 // }
+
+#[tokio::main]
+async fn main() {
+    tokio::spawn(async {
+        init_log4rs().unwrap();
+        start_server().await.unwrap();
+    });
+    sleep(Duration::from_secs(100000)).await;
+    // start_socks5_server().await.unwrap()
+}
 
 fn init_log4rs() -> ProxyResult<()> {
     let coder = PatternEncoder::new("{h({d(%Y-%m-%d %H:%M:%S)} [{f}:{L}] {l:<6})} {M}:{m}{n}");
@@ -80,30 +81,18 @@ async fn start_server() -> ProxyResult<()> {
     }
 }
 //到目前为止，我们没有做区分stream
-async fn receive_once(rx: &mut sync::mpsc::Receiver<ProxyData>, data: &mut HashMap<String, HttpTcpData>) -> ProxyResult<()> {
-    match rx.recv().await {
-        None => {}
-        Some(pd) => {
-            let tcp_data = match data.get_mut(pd.stream_id()) {
-                None => {
-                    data.insert(pd.stream_id().to_string(), HttpTcpData::new());
-                    data.get_mut(pd.stream_id()).unwrap()
-                }
-                Some(res) => res,
-            };
-            tcp_data.push(pd)?;
-        }
+async fn receive_once(rx: &mut Receiver<(Direction, Response)>) -> Option<()> {
+    let (direction, data) = rx.recv().await?;
+    match direction {
+        Direction::ClientToServer => println!("{}", data.header()),
+        Direction::ServerToClient => println!("{}", data.header()),
     }
-    Ok(())
+    None
 }
 
-async fn receive_data(mut rx: sync::mpsc::Receiver<ProxyData>) {
-    let mut data = HashMap::new();
+async fn receive_data(mut rx: Receiver<(Direction, Response)>) {
     loop {
-        match receive_once(&mut rx, &mut data).await {
-            Ok(_) => {}
-            Err(e) => error!("{}",e.to_string()),
-        }
+        let _ = receive_once(&mut rx).await;
     }
 }
 

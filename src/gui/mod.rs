@@ -1,4 +1,3 @@
-use crate::data::http::HttpPacket;
 use crate::data::ui::ProxyTab;
 use crate::data::FilterMode;
 use eframe::emath::Align;
@@ -6,9 +5,16 @@ use eframe::epaint::text::TextWrapMode;
 use eframe::{App, Frame};
 use egui::{include_image, Button, CentralPanel, Color32, Context, FontData, Id, Label, Layout, ScrollArea, Sense, Ui, UiBuilder, Visuals, Widget};
 use std::error::Error;
+use reqrio::Response;
+use crate::data::http::Request;
+
+pub struct HttpMessage {
+    request: Request,
+    response: Response,
+}
 
 pub struct ProxyView {
-    data: Vec<HttpPacket>,
+    data: Vec<HttpMessage>,
     current_item: Option<usize>,
     working: bool,
     filter_mode: FilterMode,
@@ -30,7 +36,7 @@ impl ProxyView {
         //安装图片加载器
         egui_extras::install_image_loaders(&ctx.egui_ctx);
         Ok(Box::new(ProxyView {
-            data: vec![HttpPacket::new()],
+            data: vec![],
             current_item: None,
             working: false,
             filter_mode: FilterMode::None,
@@ -118,7 +124,7 @@ impl ProxyView {
             let mut max_rect = ui.max_rect();
             max_rect.min.x = max_rect.min.x + 100.0;
             let builder = UiBuilder::new().max_rect(max_rect).layout(layout);
-            let value_resp=ui.allocate_new_ui(builder, |ui| {
+            let value_resp = ui.allocate_new_ui(builder, |ui| {
                 let label = Label::new(value.as_ref()).wrap_mode(TextWrapMode::Wrap);
                 ui.add(label);
             });
@@ -149,18 +155,18 @@ impl ProxyView {
             ui.label("请求标头");
         });
         let datum = &self.data[self.current_item.unwrap_or(0)];
-        for (key, value) in datum.request().header().keys() {
-            self.show_header_item(ui, key, value);
-        }
+        // for (key, value) in datum.request().header().keys() {
+        //     self.show_header_item(ui, key, value);
+        // }
         ui.horizontal(|ui| {
             ui.set_height(30.0);
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0.0, Color32::LIGHT_BLUE);
             ui.label("响应标头");
         });
-        for (key, value) in datum.response().header().keys() {
-            self.show_header_item(ui, key, value);
-        }
+        // for (key, value) in datum.response().header().keys() {
+        //     self.show_header_item(ui, key, value);
+        // }
     }
     fn show_root_middle_right(&mut self, ui: &mut Ui) {
         /*
