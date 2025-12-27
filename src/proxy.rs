@@ -80,27 +80,16 @@ impl ProxyStream {
     {
         tokio::spawn(async move {
             loop {
-                param.buffer.read(&mut reader).await?;
+                param.buffer.reset();
+                param.buffer.async_read(&mut reader).await?;
                 //及时把数据发送出去，减少延时
-                writer.write_all(param.buffer.as_ref()).await?;
+                writer.write_all(param.buffer.filled()).await?;
                 if param.buffer.len() == 0 { break; } //读取长度为0时，此tcp连接已断开
-                match param.direction {
-                    Direction::ClientToServer => {
-                        let method = param.buffer.as_ref().split(|&c| c == b' ' as u8).next();
-                        if let Some(method) = method && Method::try_from(method).is_ok() {
-                            //新的请求，把旧的的请求发到ui
-                            let request = mem::replace(&mut param.data, Request::new());
-                            param.sender.send((param.direction.clone(), request)).await?;
-                        }
-                        param.data.extend(&param.buffer)?;
-                    }
-                    Direction::ServerToClient => {
-                        if param.data.extend(&param.buffer)? {
-                            let response = mem::replace(&mut param.data, Response::new());
-                            param.sender.send((param.direction.clone(), response)).await?;
-                        }
-                    }
+                if param.data.extend(&param.buffer)? {
+                    let response = mem::replace(&mut param.data, Response::new());
+                    param.sender.send((param.direction.clone(), response)).await?;
                 }
+
             }
             Ok::<(), ProxyError>(())
         })
@@ -131,13 +120,13 @@ impl ProxyStream {
         Ok(())
     }
 
-    async fn handle_http(self) -> ProxyResult<()> {
+    async fn handle_http(mut self) -> ProxyResult<()> {
         let http_prefix = b"http://";
-        let start_pos = self.param.buffer.as_ref().windows(http_prefix.len()).position(|b| b == http_prefix).ok_or("获取HTTP地址失败")?;
-        let end_pos = self.param.buffer.as_ref()[start_pos + http_prefix.len()..].iter().position(|b| *b == b'/').ok_or("获取HTTP地址失败")? + start_pos + http_prefix.len();
+        let start_pos = self.param.buffer.filled().windows(http_prefix.len()).position(|b| b == http_prefix).ok_or("获取HTTP地址失败")?;
+        let end_pos = self.param.buffer.filled()[start_pos + http_prefix.len()..].iter().position(|b| *b == b'/').ok_or("获取HTTP地址失败")? + start_pos + http_prefix.len();
         println!("{} {}", start_pos, end_pos);
         //获取真实服务器地址，端口为80的会自动省略
-        let addr = String::from_utf8(self.param.buffer.as_ref()[start_pos + http_prefix.len()..end_pos].to_vec())?;
+        let addr = String::from_utf8(self.param.buffer.filled()[start_pos + http_prefix.len()..end_pos].to_vec())?;
         println!("{}", addr);
         let host = addr.split(":").next().unwrap();
         let port = match addr.contains(":") {
@@ -152,12 +141,16 @@ impl ProxyStream {
         if start_pos > 0 {
             outbound.write_all(&self.param.buffer[..start_pos]).await?;
         }
-        outbound.write(&self.param.buffer.as_ref()[end_pos..]).await?;
+        outbound.write(&self.param.buffer.filled()[end_pos..]).await?;
+        if self.param.data.extend(&self.param.buffer)? {
+            let request=mem::replace(&mut self.param.data, Request::new());
+            self.param.sender.send((Direction::ClientToServer, request)).await?;
+        }
         ProxyStream::copy_io(self.inbound, outbound, self.param).await
     }
 
     async fn handle_https(mut self) -> ProxyResult<()> {
-        let info = String::from_utf8_lossy(self.param.buffer.as_ref()).to_string();
+        let info = String::from_utf8_lossy(self.param.buffer.filled()).to_string();
         let addr = regex_find("CONNECT (.*?) ", info.as_str())?;
         if addr.len() == 0 { return Err("获取HTTPS真实地址失败".into()); }
         self.inbound.write(b"HTTP/1.1 200 OK\r\n\r\n").await?;
@@ -181,9 +174,10 @@ impl ProxyStream {
     }
 
     pub async fn start(mut self) -> ProxyResult<()> {
-        self.param.buffer.read(&mut self.inbound).await?;
+        self.param.buffer.reset();
+        self.param.buffer.async_read(&mut self.inbound).await?;
 
-        if self.param.buffer.as_ref().starts_with(b"CONNECT") {
+        if self.param.buffer.filled().starts_with(b"CONNECT") {
             self.handle_https().await?;
         } else {
             self.handle_http().await?;
